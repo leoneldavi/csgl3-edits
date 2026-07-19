@@ -604,7 +604,7 @@ static void ViewModelProjectionMatrix(Matrix4 &matrix, float fovScale, float asp
     matrix.m33 = 0;
 }
 
-static void SetupViewport(const SceneParams &params)
+static void ApplyViewport(const SceneParams &params)
 {
     SCREENINFO screenInfo{};
     screenInfo.iSize = sizeof(screenInfo);
@@ -612,6 +612,11 @@ static void SetupViewport(const SceneParams &params)
 
     int y = screenInfo.iHeight - params.viewport_y - params.viewport_h;
     glViewport(params.viewport_x, y, params.viewport_w, params.viewport_h);
+}
+
+static void SetupViewport(const SceneParams &params)
+{
+    ApplyViewport(params);
 
     glClear(GL_DEPTH_BUFFER_BIT);
 }
@@ -661,7 +666,12 @@ static void SetupView(const SceneParams &params)
     UpdateFogConstants();
 }
 
-static void SceneRenderPass(const SceneParams &params, bool onlyClientDraw)
+// world, solid brush/studio/sprite entities and solid triapi - everything
+// that writes real depth. split out from the translucent half below so
+// ssaoApplyOcclusion can run (with its draw calls actually executed, not
+// just recorded - see RenderScene) once this depth is final and before any
+// translucent geometry adds to it
+static void SceneRenderPassOpaque(const SceneParams &params, bool onlyClientDraw)
 {
     SetupViewport(params);
 
@@ -689,7 +699,13 @@ static void SceneRenderPass(const SceneParams &params, bool onlyClientDraw)
         HUD_DrawNormalTriangles();
         triapiEnd();
     }
+}
 
+// translucent entities (including additive/alpha sprites like smoke), particles,
+// beams and transparent triapi - none of these should affect or receive ambient
+// occlusion, see SceneRenderPassOpaque and ssaoApplyOcclusion
+static void SceneRenderPassTranslucent(const SceneParams &params, bool onlyClientDraw)
+{
     if (!onlyClientDraw)
     {
         entityDrawTranslucentEntities(params.origin, params.forward);
@@ -772,12 +788,36 @@ void RenderScene(const Params &params)
     sceneParams.viewport_w = refParams->viewport[2];
     sceneParams.viewport_h = refParams->viewport[3];
 
-    // if enabled, redirects the upcoming SceneRenderPass into an offscreen
-    // target instead of the real framebuffer so ssaoEndSceneAndComposite can
-    // darken it by occlusion afterwards
+    // if enabled, redirects the upcoming scene render passes into an offscreen
+    // target instead of the real framebuffer so ssaoApplyOcclusion/
+    // ssaoEndSceneAndComposite can darken it by occlusion afterwards
     bool ssaoActive = ssaoBeginScene(sceneParams.viewport_w, sceneParams.viewport_h);
 
-    SceneRenderPass(sceneParams, refParams->onlyClientDraw);
+    SceneRenderPassOpaque(sceneParams, refParams->onlyClientDraw);
+
+    // unmap+execute so the opaque draw calls above actually run now, instead
+    // of just being recorded - ssaoApplyOcclusion needs real depth in
+    // s_sceneDepthTexture to compute occlusion from, and it has to run
+    // before any translucent geometry (smoke sprites etc.) is drawn, or
+    // ambient occlusion leaks through them same as the single-pass version
+    // this replaced
+    dynamicBuffersUnmap();
+    commandExecute();
+
+    if (ssaoActive)
+    {
+        ssaoApplyOcclusion();
+
+        // ssaoApplyOcclusion repurposed the viewport for its own fullscreen
+        // passes; put it back (without re-clearing depth) before recording
+        // more real geometry into the same offscreen target
+        ApplyViewport(sceneParams);
+    }
+
+    commandRecord();
+    dynamicBuffersMap();
+
+    SceneRenderPassTranslucent(sceneParams, refParams->onlyClientDraw);
 
     dynamicBuffersUnmap();
     commandExecute();

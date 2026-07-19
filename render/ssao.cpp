@@ -25,6 +25,13 @@ struct SsaoCompositeShader : BaseShader
     // no per-instance uniforms, both samplers are constant bindings
 };
 
+// multiplies the (possibly blurred) ao term straight into the offscreen
+// scene's own color attachment via blending - see ssaoApplyOcclusion
+struct SsaoApplyShader : BaseShader
+{
+    // no per-instance uniforms, u_ao is a constant binding
+};
+
 struct SsaoBlurShader : BaseShader
 {
     GLint u_projParams;
@@ -54,6 +61,10 @@ static const ShaderUniform s_compositeUniforms[] = {
     { "u_ao", 1 }
 };
 
+static const ShaderUniform s_applyUniforms[] = {
+    { "u_ao", 0 }
+};
+
 static const ShaderUniform s_blurUniforms[] = {
     { "u_ao", 0 },
     { "u_depth", 1 },
@@ -65,6 +76,7 @@ static SsaoShader s_ssaoKernelShader;
 static SsaoHorizonShader s_ssaoHorizonShader;
 static SsaoCompositeShader s_compositeShader;
 static SsaoBlurShader s_blurShader;
+static SsaoApplyShader s_applyShader;
 
 // tiled 4x4 rotation/jitter texture sampled by ssao_horizon.frag: rg = cos/sin
 // of a per-texel random rotation angle, b = a random [0,1] step-start jitter.
@@ -148,6 +160,7 @@ void ssaoInit()
     shaderRegister(s_ssaoHorizonShader, "ssao_horizon", {}, s_ssaoHorizonUniforms);
     shaderRegister(s_compositeShader, "ssao_composite", {}, s_compositeUniforms);
     shaderRegister(s_blurShader, "ssao_blur", {}, s_blurUniforms);
+    shaderRegister(s_applyShader, "ssao_apply", {}, s_applyUniforms);
 
     CreateRandomTexture();
 }
@@ -263,17 +276,21 @@ bool ssaoBeginScene(int width, int height)
     return true;
 }
 
-void ssaoEndSceneAndComposite(int viewportX, int viewportY, int viewportW, int viewportH)
+void ssaoApplyOcclusion()
 {
     GL3_ASSERT(s_active);
-    s_active = false;
 
-    // fullscreen triangle passes, no depth/blend/culling wanted for either of them
+    // fullscreen triangle passes, no depth/blend/culling wanted for any of them
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_BLEND);
     glDisable(GL_CULL_FACE);
 
-    // pass 1: estimate occlusion from the depth buffer alone, at half resolution
+    // pass 1: estimate occlusion from the depth buffer alone, at half
+    // resolution. s_sceneDepthTexture only has opaque geometry's depth in it
+    // at this point - the caller must run this before any translucent
+    // geometry (sprites, particles, beams...) is drawn - which is exactly
+    // what keeps e.g. smoke sprites from leaking into (or being affected by)
+    // the occlusion term
     glBindFramebuffer(GL_FRAMEBUFFER, s_aoFbo);
     glViewport(0, 0, s_aoWidth, s_aoHeight);
 
@@ -338,9 +355,56 @@ void ssaoEndSceneAndComposite(int viewportX, int viewportY, int viewportW, int v
         aoResult = s_aoBlurTexture;
     }
 
-    // pass 2: composite the ao term back over the offscreen scene color, and
-    // copy the result into the framebuffer the engine actually presents
-    // (not necessarily 0, see s_targetFbo)
+    // pass 2: multiply the ao term directly into the offscreen scene's own
+    // color attachment via hardware blending, instead of the old single-pass
+    // approach of sampling scene color and ao together and writing the
+    // product out. that would be a framebuffer feedback loop here, since
+    // s_sceneColorTexture is both what we'd need to sample and the texture
+    // currently attached to the bound draw target. GL_DST_COLOR/GL_ZERO
+    // multiplies the framebuffer's existing contents by this pass's output
+    // without ever reading them through a sampler
+    glBindFramebuffer(GL_FRAMEBUFFER, s_sceneFbo);
+    glViewport(0, 0, s_width, s_height);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_DST_COLOR, GL_ZERO);
+
+    glUseProgram(s_applyShader.program);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, aoResult);
+
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glActiveTexture(GL_TEXTURE0);
+
+    // hand real GL state back to what the command buffer recorder assumes
+    // between recording sessions (see commandRecord's g_shadowState reset),
+    // since the caller resumes recording translucent geometry right after
+    // this call - s_sceneFbo stays bound, that's the target it should draw
+    // into
+    glDisable(GL_BLEND);
+    glEnable(GL_CULL_FACE);
+    glEnable(GL_DEPTH_TEST);
+}
+
+void ssaoEndSceneAndComposite(int viewportX, int viewportY, int viewportW, int viewportH)
+{
+    GL3_ASSERT(s_active);
+    s_active = false;
+
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_CULL_FACE);
+
+    // copy the offscreen scene color - opaque shading already darkened by
+    // ambient occlusion back in ssaoApplyOcclusion, translucents composited
+    // on top of that afterwards with no ao involved - into the framebuffer
+    // the engine actually presents (not necessarily 0, see s_targetFbo).
+    // reuses the composite shader with a plain white ao texture: there's
+    // nothing left to multiply in at this point, so this is really just a
+    // copy
     glBindFramebuffer(GL_FRAMEBUFFER, s_targetFbo);
 
     SCREENINFO screenInfo{};
@@ -355,7 +419,7 @@ void ssaoEndSceneAndComposite(int viewportX, int viewportY, int viewportW, int v
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, s_sceneColorTexture);
     glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, aoResult);
+    glBindTexture(GL_TEXTURE_2D, g_state.whiteTexture);
 
     glDrawArrays(GL_TRIANGLES, 0, 3);
 
