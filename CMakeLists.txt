@@ -33,8 +33,20 @@ endif()
 option(MESHOPT_INSTALL "Install library" OFF)
 add_subdirectory(external/meshoptimizer)
 
-add_executable(shaderembed shaderembed/main.cpp)
-target_include_directories(shaderembed PRIVATE external/stb)
+if (CMAKE_CROSSCOMPILING)
+    # shaderembed runs at build time to generate shader_sources.inl, so it
+    # must be a host-native binary even when the rest of the tree is being
+    # cross-compiled (e.g. to Windows via mingw-w64). build it once with a
+    # normal, non-cross-compiling cmake invocation and point this at it.
+    set(SHADEREMBED_EXECUTABLE "" CACHE FILEPATH "Path to a host-native shaderembed executable (required when cross-compiling)")
+    if (NOT SHADEREMBED_EXECUTABLE)
+        message(FATAL_ERROR "Cross-compiling requires -DSHADEREMBED_EXECUTABLE=/path/to/native/shaderembed (build it first with a plain native cmake build)")
+    endif()
+else()
+    add_executable(shaderembed shaderembed/main.cpp)
+    target_include_directories(shaderembed PRIVATE external/stb)
+    set(SHADEREMBED_EXECUTABLE shaderembed)
+endif()
 
 set(RENDER_SRC
     render/beam.cpp
@@ -65,6 +77,7 @@ set(RENDER_SRC
     render/shader.cpp
     render/skybox.cpp
     render/sprite.cpp
+    render/ssao.cpp
     render/studio_cache.cpp
     render/studio_misc.cpp
     render/studio_proxy.cpp
@@ -91,7 +104,11 @@ target_link_libraries(render PRIVATE meshoptimizer)
 
 # shader junk
 set(SHADER_DIR ${CMAKE_CURRENT_LIST_DIR}/shaders)
-file(GLOB SHADER_SOURCES ${SHADER_DIR}/*.vert ${SHADER_DIR}/*.frag)
+# CONFIGURE_DEPENDS: re-glob on every build, not just on a fresh configure,
+# so a newly added shader file doesn't silently miss shader_sources.inl and
+# fail with "No such shader embedded" at runtime until someone remembers to
+# rerun cmake by hand
+file(GLOB SHADER_SOURCES CONFIGURE_DEPENDS ${SHADER_DIR}/*.vert ${SHADER_DIR}/*.frag)
 set(SHADER_SOURCES_FILE ${CMAKE_CURRENT_BINARY_DIR}/shader_sources.inl)
 
 target_compile_definitions(render PRIVATE
@@ -100,8 +117,8 @@ target_compile_definitions(render PRIVATE
 
 add_custom_command(
     OUTPUT ${SHADER_SOURCES_FILE}
-    COMMAND shaderembed ${SHADER_SOURCES} > ${SHADER_SOURCES_FILE}
-    DEPENDS shaderembed ${SHADER_SOURCES}
+    COMMAND ${SHADEREMBED_EXECUTABLE} ${SHADER_SOURCES} > ${SHADER_SOURCES_FILE}
+    DEPENDS ${SHADEREMBED_EXECUTABLE} ${SHADER_SOURCES}
     VERBATIM)
 
 target_sources(render PRIVATE ${SHADER_SOURCES_FILE})

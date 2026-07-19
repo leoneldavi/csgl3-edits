@@ -19,6 +19,7 @@
 #include "triapigl3.h"
 #include "hudgl3.h"
 #include "screenfadegl3.h"
+#include "ssao.h"
 #include "particle.h"
 #include "studio_misc.h"
 #include "beam.h"
@@ -293,6 +294,7 @@ void Initialize(struct engine_studio_api_s *studio, r_studio_interface_s **pinte
     screenFadeInit();
     beamInit();
     detailInit();
+    ssaoInit();
 
     // dummy textures for fullbright etc.
     {
@@ -758,24 +760,32 @@ void RenderScene(const Params &params)
     commandRecord();
     dynamicBuffersMap();
 
-    {
-        SceneParams sceneParams;
-        sceneParams.origin = refParams->vieworg;
-        sceneParams.angles = refParams->viewangles;
-        AngleVectors(sceneParams.angles, &sceneParams.forward, &sceneParams.right, &sceneParams.up);
-        sceneParams.simOrigin = refParams->simorg;
-        sceneParams.fov = params.fov;
-        sceneParams.viewModelFov = params.viewModelFov;
-        sceneParams.viewport_x = refParams->viewport[0];
-        sceneParams.viewport_y = refParams->viewport[1];
-        sceneParams.viewport_w = refParams->viewport[2];
-        sceneParams.viewport_h = refParams->viewport[3];
+    SceneParams sceneParams;
+    sceneParams.origin = refParams->vieworg;
+    sceneParams.angles = refParams->viewangles;
+    AngleVectors(sceneParams.angles, &sceneParams.forward, &sceneParams.right, &sceneParams.up);
+    sceneParams.simOrigin = refParams->simorg;
+    sceneParams.fov = params.fov;
+    sceneParams.viewModelFov = params.viewModelFov;
+    sceneParams.viewport_x = refParams->viewport[0];
+    sceneParams.viewport_y = refParams->viewport[1];
+    sceneParams.viewport_w = refParams->viewport[2];
+    sceneParams.viewport_h = refParams->viewport[3];
 
-        SceneRenderPass(sceneParams, refParams->onlyClientDraw);
-    }
+    // if enabled, redirects the upcoming SceneRenderPass into an offscreen
+    // target instead of the real framebuffer so ssaoEndSceneAndComposite can
+    // darken it by occlusion afterwards
+    bool ssaoActive = ssaoBeginScene(sceneParams.viewport_w, sceneParams.viewport_h);
+
+    SceneRenderPass(sceneParams, refParams->onlyClientDraw);
 
     dynamicBuffersUnmap();
     commandExecute();
+
+    if (ssaoActive)
+    {
+        ssaoEndSceneAndComposite(sceneParams.viewport_x, sceneParams.viewport_y, sceneParams.viewport_w, sceneParams.viewport_h);
+    }
 
     // this fucking sucks, actually
     if (!refParams->onlyClientDraw)
